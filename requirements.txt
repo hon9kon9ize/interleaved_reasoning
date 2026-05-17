@@ -1,0 +1,8 @@
+accelerate
+datasets
+pytest
+sympy
+tensorboard
+torch
+transformers
+trl
