@@ -4,6 +4,7 @@ from interleaved_grpo.rewards import (
     correctness_reward_fn,
     efficiency_penalty_fn,
     interleaved_format_reward_fn,
+    language_consistency_reward_fn,
 )
 
 
@@ -49,3 +50,23 @@ def test_interleaved_format_reward_scores_structure(completion, expected):
 )
 def test_efficiency_penalty_scores_private_public_ratio(completion, expected):
     assert efficiency_penalty_fn(["question"], [completion]) == [expected]
+
+
+def test_language_consistency_reward_scores_reasoning_language():
+    completions = [
+        "<think>首先，我哋要計吓總數，跟住再除返每日可以完成嘅數量。</think><answer>7</answer>",
+        "<think>First, I calculate the total and divide by the daily capacity.</think><answer>7</answer>",
+        "<answer>7</answer>",
+    ]
+
+    assert language_consistency_reward_fn(
+        ["q1", "q2", "q3"],
+        completions,
+        reasoning_language=["yue", "yue", "yue"],
+    ) == [1.0, 0.0, 0.0]
+
+
+def test_language_consistency_reward_supports_english_reasoning():
+    completion = "<think>First, calculate the total number of towels, then divide by capacity.</think><answer>7</answer>"
+
+    assert language_consistency_reward_fn(["q"], [completion], reasoning_language=["en"]) == [1.0]

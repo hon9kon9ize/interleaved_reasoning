@@ -12,13 +12,16 @@ import time
 from typing import Any
 
 from .datasets_loader import build_interleaved_messages, dataset_from_args
-from .rewards import REWARD_FUNCS
+from .rewards import REWARD_FUNCS, language_consistency_reward_fn
+
+
+BASE_REWARD_WEIGHTS = [1.0, 0.5, 0.3, 1.0]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--dataset", choices=["gsm8k", "math", "toolmind", "hybrid"], default="gsm8k")
+    parser.add_argument("--dataset", choices=["gsm8k", "math", "toolmind", "hybrid", "reasoning-lang"], default="gsm8k")
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--dataset-subset", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -53,11 +56,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sequential-hybrid-sampler", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--language-consistency-reward",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the reasoning-language consistency reward. Defaults on when reasoning_lang metadata is present.",
+    )
+    parser.add_argument(
+        "--reasoning-lang",
+        "--reasoning_lang",
+        "--reansoning_lang",
+        dest="reasoning_lang",
+        default=None,
+        help="Fallback reasoning language when the dataset does not provide a reasoning_lang column.",
+    )
+    parser.add_argument("--language-reward-weight", type=float, default=0.2)
+    parser.add_argument(
         "--reward-weights",
         type=float,
-        nargs=4,
-        default=[1.0, 0.5, 0.3, 1.0],
-        metavar=("OUTCOME", "STEP", "TTFT", "EFFICIENCY"),
+        nargs="+",
+        default=None,
+        metavar="WEIGHT",
     )
     return parser
 
@@ -137,7 +155,15 @@ class GenerationRewardLogger:
                 "completions": completion_list,
                 "columns": {
                     name: kwargs.get(name)
-                    for name in ("answer", "expected_answer", "task_type", "target_has_tool_call")
+                    for name in (
+                        "answer",
+                        "expected_answer",
+                        "task_type",
+                        "target_has_tool_call",
+                        "reasoning_lang",
+                        "reasoning_language",
+                        "language",
+                    )
                     if name in kwargs
                 },
                 "rewards": {},
@@ -182,6 +208,9 @@ class GenerationRewardLogger:
                     "expected_answer": _jsonable(_column_item(columns.get("expected_answer"), index)),
                     "task_type": _jsonable(_column_item(columns.get("task_type"), index)),
                     "target_has_tool_call": _jsonable(_column_item(columns.get("target_has_tool_call"), index)),
+                    "reasoning_lang": _jsonable(_column_item(columns.get("reasoning_lang"), index)),
+                    "reasoning_language": _jsonable(_column_item(columns.get("reasoning_language"), index)),
+                    "language": _jsonable(_column_item(columns.get("language"), index)),
                     "rewards": reward_components,
                     "weighted_reward": weighted_reward,
                 }
@@ -213,16 +242,54 @@ def generation_log_path(args: argparse.Namespace) -> str:
     return args.generation_log_file or str(Path(args.output_dir) / "generations.jsonl")
 
 
-def build_reward_funcs(args: argparse.Namespace) -> list[Any]:
+def dataset_has_reasoning_lang(dataset: Any) -> bool:
+    names = getattr(dataset, "column_names", None)
+    if names is None and isinstance(dataset, dict):
+        names = dataset.keys()
+    return names is not None and any(name in names for name in ("reasoning_lang", "reasoning_language"))
+
+
+def use_language_consistency_reward(args: argparse.Namespace, dataset: Any | None = None) -> bool:
+    if args.language_consistency_reward is not None:
+        return bool(args.language_consistency_reward)
+    return bool(args.reasoning_lang) or dataset_has_reasoning_lang(dataset)
+
+
+def select_reward_funcs(args: argparse.Namespace, dataset: Any | None = None) -> list[Any]:
+    reward_funcs = list(REWARD_FUNCS)
+    if use_language_consistency_reward(args, dataset):
+        reward_funcs.append(language_consistency_reward_fn)
+    return reward_funcs
+
+
+def resolve_reward_weights(args: argparse.Namespace, reward_funcs: list[Any]) -> list[float]:
+    if args.reward_weights is not None:
+        if len(args.reward_weights) != len(reward_funcs):
+            raise ValueError(f"Expected {len(reward_funcs)} reward weights, got {len(args.reward_weights)}.")
+        return list(args.reward_weights)
+
+    weights = list(BASE_REWARD_WEIGHTS)
+    if any(reward_func.__name__ == "language_consistency_reward_fn" for reward_func in reward_funcs):
+        weights.append(args.language_reward_weight)
+    return weights
+
+
+def build_reward_funcs(
+    args: argparse.Namespace,
+    reward_funcs: list[Any] | None = None,
+    reward_weights: list[float] | None = None,
+) -> list[Any]:
     """Return reward functions, optionally wrapped with generation JSONL logging."""
+    reward_funcs = reward_funcs or select_reward_funcs(args)
+    reward_weights = reward_weights or resolve_reward_weights(args, reward_funcs)
     if args.disable_generation_logging:
-        return list(REWARD_FUNCS)
+        return list(reward_funcs)
     logger = GenerationRewardLogger(
         generation_log_path(args),
-        [reward_func.__name__ for reward_func in REWARD_FUNCS],
-        args.reward_weights,
+        [reward_func.__name__ for reward_func in reward_funcs],
+        reward_weights,
     )
-    return [logger.wrap(reward_func) for reward_func in REWARD_FUNCS]
+    return [logger.wrap(reward_func) for reward_func in reward_funcs]
 
 
 def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
@@ -260,20 +327,40 @@ def with_sequential_train_sampler(trainer_cls: Any) -> Any:
     return SequentialSamplerTrainer
 
 
-def apply_interleaved_chat_template(dataset: Any, tokenizer: Any) -> Any:
+def apply_interleaved_chat_template(
+    dataset: Any,
+    tokenizer: Any,
+    default_reasoning_lang: str | None = None,
+) -> Any:
     """Convert normalized questions into chat-template prompts for GRPO."""
 
     def process_data(examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         task_types = examples.get("task_type", ["math"] * len(examples["question"]))
+        reasoning_langs = examples.get("reasoning_lang", examples.get("reasoning_language"))
+        if reasoning_langs is None and default_reasoning_lang:
+            reasoning_langs = [default_reasoning_lang] * len(examples["question"])
+        if reasoning_langs is None:
+            reasoning_langs = [None] * len(examples["question"])
+        elif default_reasoning_lang:
+            reasoning_langs = [
+                default_reasoning_lang if value is None or str(value).strip() == "" else value
+                for value in reasoning_langs
+            ]
         prompts = [
             tokenizer.apply_chat_template(
-                build_interleaved_messages(question, task_type=task_type),
+                build_interleaved_messages(
+                    question,
+                    task_type=task_type,
+                    reasoning_lang=reasoning_lang,
+                ),
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            for question, task_type in zip(examples["question"], task_types)
+            for question, task_type, reasoning_lang in zip(examples["question"], task_types, reasoning_langs)
         ]
         processed = {"prompt": prompts, "answer": examples["answer"], "task_type": task_types}
+        if "reasoning_lang" in examples or "reasoning_language" in examples or default_reasoning_lang:
+            processed["reasoning_lang"] = reasoning_langs
         if "tool_definitions" in examples:
             processed["tool_definitions"] = examples["tool_definitions"]
         if "mock_outputs" in examples:
@@ -295,7 +382,9 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = apply_interleaved_chat_template(dataset_from_args(args), tokenizer)
+    dataset = apply_interleaved_chat_template(dataset_from_args(args), tokenizer, default_reasoning_lang=args.reasoning_lang)
+    reward_funcs = select_reward_funcs(args, dataset)
+    reward_weights = resolve_reward_weights(args, reward_funcs)
 
     training_args = GRPOConfig(
         output_dir=args.output_dir,
@@ -309,7 +398,7 @@ def main() -> None:
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         beta=args.beta,
-        reward_weights=args.reward_weights,
+        reward_weights=reward_weights,
         bf16=args.bf16,
         gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=args.logging_steps,
@@ -329,7 +418,7 @@ def main() -> None:
         processing_class=tokenizer,
         args=training_args,
         train_dataset=dataset,
-        reward_funcs=build_reward_funcs(args),
+        reward_funcs=build_reward_funcs(args, reward_funcs, reward_weights),
     )
     trainer.train()
 

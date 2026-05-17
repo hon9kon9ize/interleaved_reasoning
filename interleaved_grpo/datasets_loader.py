@@ -5,13 +5,22 @@ from __future__ import annotations
 from argparse import Namespace
 import json
 import html
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from datasets import Dataset
 
 
-DatasetName = Literal["gsm8k", "math", "toolmind", "hybrid"]
+DatasetName = Literal["gsm8k", "math", "toolmind", "hybrid", "reasoning-lang"]
+REFERENCE_REASONING_LANG_DATA = Path("/Users/josephcheng/Projects/rl-data-geneator/data/gsm8k_yue_translated.csv")
+LANGUAGE_NAMES = {
+    "en": "English",
+    "zh": "Chinese",
+    "zh-hant": "Traditional Chinese",
+    "zh-hans": "Simplified Chinese",
+    "yue": "Cantonese",
+}
 
 
 INTERLEAVED_SYSTEM_PROMPT = (
@@ -23,10 +32,22 @@ INTERLEAVED_SYSTEM_PROMPT = (
 )
 
 
-def build_interleaved_messages(question: str, task_type: str = "math") -> list[dict[str, str]]:
+def build_interleaved_messages(
+    question: str,
+    task_type: str = "math",
+    reasoning_lang: str | None = None,
+    reasoning_language: str | None = None,
+) -> list[dict[str, str]]:
     """Build chat messages that guide the policy toward interleaved reasoning."""
+    target_language = reasoning_lang or reasoning_language
     if task_type == "tool":
         user_content = f"Solve this tool-use task with interleaved plan-action-reflection steps: {question.strip()}"
+    elif target_language:
+        language = _language_name(target_language or "en")
+        user_content = (
+            f"Solve this step-by-step. Write all private reasoning inside <think>...</think> in {language}. "
+            f"Put only the final math result in <answer>...</answer>: {question.strip()}"
+        )
     else:
         user_content = f"Solve this step-by-step. Put the final math result in <answer>...</answer>: {question.strip()}"
     return [
@@ -40,13 +61,16 @@ def _extract_gsm8k_answer(answer: str) -> str:
 
 
 def _extract_math_answer(answer: str) -> str:
-    if "\\boxed" in answer:
-        from .parser import extract_math_answer
+    from .parser import extract_math_answer
 
-        extracted = extract_math_answer(answer)
-        if extracted:
-            return extracted
+    extracted = extract_math_answer(answer)
+    if extracted:
+        return extracted
     return answer.strip()
+
+
+def _language_name(language: str) -> str:
+    return LANGUAGE_NAMES.get(str(language).strip().lower(), str(language).strip() or "English")
 
 
 def _stringify(value: object) -> str:
@@ -220,6 +244,50 @@ def _normalize_toolmind_with_target_count(dataset: "Dataset", max_samples: int |
     return _normalize_toolmind(dataset)
 
 
+def _resolve_reasoning_lang_data_file(subset: str | None) -> str:
+    if subset:
+        candidate = Path(subset).expanduser()
+        if candidate.exists():
+            return str(candidate)
+    local_candidate = Path("data/gsm8k_yue_translated.csv")
+    if local_candidate.exists():
+        return str(local_candidate)
+    if REFERENCE_REASONING_LANG_DATA.exists():
+        return str(REFERENCE_REASONING_LANG_DATA)
+    raise FileNotFoundError(
+        "Could not find reasoning-lang CSV. Pass a CSV path via --dataset-subset, "
+        "or place gsm8k_yue_translated.csv under ./data/."
+    )
+
+
+def _normalize_reasoning_lang(dataset: "Dataset", reasoning_language: str = "yue") -> "Dataset":
+    question_columns = ("question_yue", "question", "problem", "prompt", "input")
+    answer_columns = ("answer", "final_answer", "expected_answer", "target")
+
+    def process_reasoning_lang(batch: dict[str, list[object]]) -> dict[str, list[str]]:
+        questions: list[str] = []
+        answers: list[str] = []
+        languages: list[str] = []
+        batch_size = len(next(iter(batch.values()))) if batch else 0
+        for index in range(batch_size):
+            language = _first_present(batch, ("reasoning_language", "language", "lang"), index) or reasoning_language
+            question = _first_present(batch, question_columns, index)
+            answer = _first_present(batch, answer_columns, index)
+            questions.append(question)
+            answers.append(_extract_math_answer(answer))
+            languages.append(language.strip().lower())
+        return {
+            "question": questions,
+            "answer": answers,
+            "task_type": ["math"] * batch_size,
+            "reasoning_lang": languages,
+            "tool_definitions": ["[]" for _ in range(batch_size)],
+            "mock_outputs": ["{}" for _ in range(batch_size)],
+        }
+
+    return dataset.map(process_reasoning_lang, batched=True, remove_columns=dataset.column_names)
+
+
 def load_training_dataset(
     dataset_name: DatasetName = "gsm8k",
     split: str = "train",
@@ -267,6 +335,10 @@ def load_training_dataset(
             split = "open_datasets"
         dataset = load_dataset("Nanbeige/ToolMind", subset, split=split)
         dataset = _normalize_toolmind_with_target_count(dataset, max_samples)
+    elif dataset_name == "reasoning-lang":
+        data_file = _resolve_reasoning_lang_data_file(subset)
+        dataset = load_dataset("csv", data_files=data_file, split=split)
+        dataset = _normalize_reasoning_lang(dataset)
     elif dataset_name == "hybrid":
         per_source_samples = max_samples // 2 if max_samples else None
         math_dataset = load_training_dataset(

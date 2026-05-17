@@ -23,6 +23,10 @@ if [[ -n "${MAX_SAMPLES:-}" ]]; then
   ARGS+=(--max-samples "${MAX_SAMPLES}")
 fi
 
+if [[ -n "${REASONING_LANG:-}" ]]; then
+  ARGS+=(--reasoning-lang "${REASONING_LANG}")
+fi
+
 if [[ "${USE_VLLM:-0}" == "1" ]]; then
   ARGS+=(--use-vllm)
 fi

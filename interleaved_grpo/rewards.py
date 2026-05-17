@@ -404,6 +404,107 @@ def efficiency_penalty_fn(
     return rewards
 
 
+def _get_language_targets(kwargs: dict[str, Any], count: int) -> list[str | None]:
+    values = kwargs.get("reasoning_lang", kwargs.get("reasoning_language", kwargs.get("language")))
+    if values is None:
+        return [None] * count
+    if isinstance(values, str):
+        return [values] * count
+    targets: list[str | None] = []
+    for index in range(count):
+        item = _indexed_item(values, index)
+        targets.append(str(item) if item is not None else None)
+    return targets
+
+
+def _reasoning_text_for_language(completion: str) -> str:
+    stats = parse_interleaved_stream(completion)
+    if stats["think_blocks"]:
+        return " ".join(block.strip() for block in stats["think_blocks"] if block.strip())
+    if "</think>" in completion:
+        return completion.split("</think>", 1)[0].replace("<think>", " ").strip()
+    return ""
+
+
+def _cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def _latin_word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z]{2,}", text))
+
+
+def _looks_cantonese(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    try:
+        from cantofilter import judge as yue_judge
+
+        judgement = yue_judge(stripped)
+        if judgement in {"cantonese", "mixed"}:
+            return True
+        if judgement == "neutral" and _cjk_count(stripped) > 0:
+            return True
+    except Exception:
+        pass
+
+    cantonese_markers = (
+        "嘅",
+        "咗",
+        "佢",
+        "哋",
+        "唔",
+        "喺",
+        "呢",
+        "咁",
+        "啲",
+        "嚟",
+        "晒",
+        "冇",
+        "嗰",
+        "啦",
+        "呀",
+        "㗎",
+        "咩",
+    )
+    cjk = _cjk_count(stripped)
+    return cjk > 0 and (any(marker in stripped for marker in cantonese_markers) or cjk >= 12)
+
+
+def _matches_language(text: str, language: str | None) -> bool:
+    if language is None:
+        return False
+    normalized = language.strip().lower()
+    if normalized == "":
+        return False
+    if normalized == "yue":
+        return _looks_cantonese(text)
+    if normalized in {"zh", "zh-hant", "zh-hans", "cn"}:
+        return _cjk_count(text) >= 4
+    if normalized == "en":
+        return _latin_word_count(text) >= 4 and _cjk_count(text) == 0
+    return True
+
+
+def language_consistency_reward_fn(
+    prompts: list[str],
+    completions: list[str],
+    **kwargs: Any,
+) -> list[float]:
+    """Reward `<think>` reasoning that matches the requested natural language."""
+    targets = _get_language_targets(kwargs, len(completions))
+    rewards: list[float] = []
+    for completion, target_language in zip(completions, targets):
+        reasoning_text = _reasoning_text_for_language(completion)
+        if not reasoning_text or target_language is None:
+            rewards.append(0.0)
+            continue
+        rewards.append(1.0 if _matches_language(reasoning_text, target_language) else 0.0)
+    return rewards
+
+
 REWARD_FUNCS = [
     outcome_correctness_reward_fn,
     conditional_step_reward_fn,

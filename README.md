@@ -87,12 +87,22 @@ Supported `--dataset` values:
 - `math`: Hendrycks competition math. Targets are extracted from boxed or final answers.
 - `toolmind`: ToolMind `open_datasets` by default when `--dataset-split train` is used.
 - `hybrid`: alternating GSM8K and ToolMind rows for a 1:1 math/tool mix.
+- `reasoning-lang`: translated GSM8K-style math rows that require `<think>` reasoning in a target language such as Cantonese (`yue`), while still rewarding final `<answer>...</answer>` correctness.
 
 ToolMind rows preserve:
 
 - `tool_definitions`: JSON-string tool schemas from the source row.
 - `mock_outputs`: replay outputs from observed previous tool calls.
 - `target_has_tool_call`: whether the final target is a literal `<tool_call>...</tool_call>` action or final public text.
+
+Reasoning-language metadata:
+
+- `reasoning_lang`: natural-language target for private reasoning, for example `yue`, `zh`, or `en`.
+- If a dataset provides a `reasoning_lang` column, the trainer automatically enables the language consistency reward.
+- If a dataset does not provide `reasoning_lang`, pass `--reasoning-lang yue` to use one target language for all rows.
+- The parser also accepts `--reasoning_lang` and the typo-compatible `--reansoning_lang` alias.
+- The built-in translated GSM8K loader still uses `task_type="math"`; `reasoning_lang` is only auxiliary reward metadata.
+- The default CSV is resolved from the referenced `rl-data-geneator` project when present. Pass a custom CSV path with `--dataset-subset path/to/file.csv`.
 
 ## Training
 
@@ -137,6 +147,16 @@ python -m interleaved_grpo.train \
   --num-generations 4
 ```
 
+Use a language reward with an existing dataset that does not have a `reasoning_lang` column:
+
+```bash
+python -m interleaved_grpo.train \
+  --dataset gsm8k \
+  --reasoning-lang yue \
+  --max-samples 1000 \
+  --output-dir ./runs/gsm8k_yue_reasoning
+```
+
 Train on the hybrid GSM8K + ToolMind mix:
 
 ```bash
@@ -145,6 +165,18 @@ python -m interleaved_grpo.train \
   --dataset hybrid \
   --max-samples 10000 \
   --output-dir ./runs/hybrid_interleaved \
+  --num-generations 4
+```
+
+Train on Cantonese reasoning-language math:
+
+```bash
+python -m interleaved_grpo.train \
+  --model-id Qwen/Qwen2.5-7B-Instruct \
+  --dataset reasoning-lang \
+  --dataset-subset /Users/josephcheng/Projects/rl-data-geneator/data/gsm8k_yue_translated.csv \
+  --max-samples 1000 \
+  --output-dir ./runs/reasoning_lang_yue \
   --num-generations 4
 ```
 
@@ -215,17 +247,31 @@ Default reward functions:
 3. `ttft_reward_fn`: rewards a non-empty but short first `<think>` block.
 4. `efficiency_penalty_fn`: penalizes bloated private reasoning relative to public output.
 
+When `reasoning_lang` metadata is present, or when `--reasoning-lang` is set, training appends:
+
+5. `language_consistency_reward_fn`: rewards `<think>` reasoning that matches `reasoning_lang`.
+
 Default weights:
 
 ```text
 OUTCOME=1.0 STEP=0.5 TTFT=0.3 EFFICIENCY=1.0
 ```
 
+For language consistency, the default language reward weight is `0.2`.
+
 Override them with:
 
 ```bash
 python -m interleaved_grpo.train --reward-weights 1.0 0.5 0.3 1.0
 ```
+
+When language consistency is enabled, pass five weights:
+
+```bash
+python -m interleaved_grpo.train --dataset reasoning-lang --reward-weights 1.0 0.5 0.3 1.0 0.2
+```
+
+The language reward uses `cantofilter` when installed for Cantonese detection, with a lightweight CJK/Cantonese-marker fallback otherwise.
 
 ## Operational Notes
 

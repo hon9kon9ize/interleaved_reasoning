@@ -3,8 +3,11 @@ import json
 from interleaved_grpo.train import (
     GenerationRewardLogger,
     build_parser,
+    dataset_has_reasoning_lang,
     generation_log_path,
+    resolve_reward_weights,
     resolve_report_to,
+    select_reward_funcs,
     with_sequential_train_sampler,
 )
 
@@ -14,9 +17,34 @@ def test_train_defaults_match_agentic_reward_suite():
 
     assert args.beta == 0.01
     assert args.num_generations == 4
-    assert args.reward_weights == [1.0, 0.5, 0.3, 1.0]
+    assert resolve_reward_weights(args, select_reward_funcs(args)) == [1.0, 0.5, 0.3, 1.0]
     assert args.sequential_hybrid_sampler
     assert generation_log_path(args) == "interleaved_grpo_output/generations.jsonl"
+
+
+def test_reasoning_lang_selects_language_reward():
+    args = build_parser().parse_args(["--dataset", "reasoning-lang"])
+    reward_funcs = select_reward_funcs(args, {"reasoning_lang": ["yue"]})
+
+    assert reward_funcs[-1].__name__ == "language_consistency_reward_fn"
+    assert resolve_reward_weights(args, reward_funcs) == [1.0, 0.5, 0.3, 1.0, 0.2]
+
+
+def test_reasoning_lang_column_selects_language_reward_for_any_dataset():
+    args = build_parser().parse_args([])
+    dataset = {"prompt": ["q"], "answer": ["4"], "reasoning_lang": ["yue"]}
+    reward_funcs = select_reward_funcs(args, dataset)
+
+    assert dataset_has_reasoning_lang(dataset)
+    assert reward_funcs[-1].__name__ == "language_consistency_reward_fn"
+
+
+def test_reasoning_lang_cli_fallback_selects_language_reward():
+    args = build_parser().parse_args(["--reansoning_lang", "yue"])
+    reward_funcs = select_reward_funcs(args, {"prompt": ["q"], "answer": ["4"]})
+
+    assert args.reasoning_lang == "yue"
+    assert reward_funcs[-1].__name__ == "language_consistency_reward_fn"
 
 
 def test_wandb_flag_adds_wandb_report_target():
