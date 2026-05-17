@@ -40,6 +40,8 @@ Use Group Relative Policy Optimization (GRPO) to reward:
 - For ToolMind final action targets, the serialized gold `<tool_call>...</tool_call>` is the oracle; do not replace it with a placeholder target string.
 - Synthetic completion formatting must escape literal XML-like text in assistant prose before appending generated `<tool_call>...</tool_call>` tags.
 - Training defaults should be conservative and configurable through CLI flags so smoke tests can run on tiny subsets before large jobs.
+- `train.py` defaults to `--num-generations 4`; increase it explicitly for larger GRPO groups.
+- Training writes generated completions and reward components to `OUTPUT_DIR/generations.jsonl` unless `--disable-generation-logging` is set. Use `--wandb` to add Weights & Biases metrics reporting.
 - Do not start a full 7B GRPO run as part of routine validation. Validate parser and reward behavior with lightweight tests first.
 
 ## Dataset Status

@@ -6,3 +6,4 @@ tensorboard
 torch
 transformers
 trl
+wandb

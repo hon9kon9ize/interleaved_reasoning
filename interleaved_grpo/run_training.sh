@@ -14,7 +14,7 @@ ARGS=(
   --output-dir "${OUTPUT_DIR}"
   --per-device-train-batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}"
-  --num-generations "${NUM_GENERATIONS:-8}"
+  --num-generations "${NUM_GENERATIONS:-4}"
   --max-completion-length "${MAX_COMPLETION_LENGTH:-1024}"
   --learning-rate "${LEARNING_RATE:-5e-6}"
 )
@@ -27,9 +27,20 @@ if [[ "${USE_VLLM:-0}" == "1" ]]; then
   ARGS+=(--use-vllm)
 fi
 
+if [[ "${WANDB:-0}" == "1" ]]; then
+  ARGS+=(--wandb)
+fi
+
+if [[ -n "${GENERATION_LOG_FILE:-}" ]]; then
+  ARGS+=(--generation-log-file "${GENERATION_LOG_FILE}")
+fi
+
+if [[ "${DISABLE_GENERATION_LOGGING:-0}" == "1" ]]; then
+  ARGS+=(--disable-generation-logging)
+fi
+
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   srun accelerate launch --num_processes "${NUM_PROCESSES}" -m interleaved_grpo.train "${ARGS[@]}"
 else
   accelerate launch --num_processes "${NUM_PROCESSES}" -m interleaved_grpo.train "${ARGS[@]}"
 fi
-

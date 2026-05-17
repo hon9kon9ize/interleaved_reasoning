@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
+import json
+import os
+from pathlib import Path
+import time
 from typing import Any
 
 from .datasets_loader import build_interleaved_messages, dataset_from_args
@@ -22,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--num-train-epochs", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=-1)
-    parser.add_argument("--num-generations", type=int, default=8)
+    parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--max-prompt-length", type=int, default=512)
     parser.add_argument("--max-completion-length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -31,6 +37,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--report-to", default="tensorboard")
+    parser.add_argument("--wandb", action="store_true", help="Also report training metrics to Weights & Biases.")
+    parser.add_argument(
+        "--generation-log-file",
+        default=None,
+        help="JSONL path for generated completions and reward components. Defaults to OUTPUT_DIR/generations.jsonl.",
+    )
+    parser.add_argument(
+        "--disable-generation-logging",
+        action="store_true",
+        help="Disable JSONL logging of generated completions.",
+    )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=False)
@@ -43,6 +60,183 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("OUTCOME", "STEP", "TTFT", "EFFICIENCY"),
     )
     return parser
+
+
+def _column_item(values: Any, index: int) -> Any:
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes, dict)):
+        return values
+    try:
+        return values[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _as_list(values: Any) -> list[Any]:
+    if isinstance(values, list):
+        return values
+    if isinstance(values, tuple):
+        return list(values)
+    return [values]
+
+
+def _jsonable(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+class GenerationRewardLogger:
+    """Collect per-reward outputs and write one JSONL record per generated completion."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        reward_func_names: list[str],
+        reward_weights: list[float] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.reward_func_names = reward_func_names
+        weights = reward_weights or [1.0] * len(reward_func_names)
+        self.reward_weights = dict(zip(reward_func_names, weights))
+        self._pending_batches: dict[str, dict[str, Any]] = {}
+        self._next_batch_id = 0
+
+    def wrap(self, reward_func: Any) -> Any:
+        """Wrap a TRL reward function without changing its return value."""
+
+        @functools.wraps(reward_func)
+        def wrapped(prompts: list[str], completions: list[str], **kwargs: Any) -> list[float]:
+            rewards = reward_func(prompts, completions, **kwargs)
+            self.record(reward_func.__name__, prompts, completions, rewards, kwargs)
+            return rewards
+
+        return wrapped
+
+    def record(
+        self,
+        reward_name: str,
+        prompts: list[str],
+        completions: list[str],
+        rewards: list[float],
+        kwargs: dict[str, Any],
+    ) -> None:
+        prompt_list = _as_list(prompts)
+        completion_list = _as_list(completions)
+        key = self._batch_key(prompt_list, completion_list)
+        batch = self._pending_batches.get(key)
+        if batch is None:
+            batch = {
+                "batch_id": self._next_batch_id,
+                "created_at": time.time(),
+                "prompts": prompt_list,
+                "completions": completion_list,
+                "columns": {
+                    name: kwargs.get(name)
+                    for name in ("answer", "expected_answer", "task_type", "target_has_tool_call")
+                    if name in kwargs
+                },
+                "rewards": {},
+            }
+            self._pending_batches[key] = batch
+            self._next_batch_id += 1
+
+        batch["rewards"][reward_name] = list(rewards)
+        if all(name in batch["rewards"] for name in self.reward_func_names):
+            self._flush_batch(batch)
+            del self._pending_batches[key]
+
+    def _batch_key(self, prompts: list[Any], completions: list[Any]) -> str:
+        payload = json.dumps({"prompts": prompts, "completions": completions}, sort_keys=True, default=str)
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+    def _flush_batch(self, batch: dict[str, Any]) -> None:
+        prompts = batch["prompts"]
+        completions = batch["completions"]
+        columns = batch["columns"]
+        rewards_by_name = batch["rewards"]
+        records = []
+        for index, completion in enumerate(completions):
+            reward_components = {
+                name: float(values[index])
+                for name, values in rewards_by_name.items()
+                if index < len(values)
+            }
+            weighted_reward = sum(
+                reward * self.reward_weights.get(name, 1.0)
+                for name, reward in reward_components.items()
+            )
+            records.append(
+                {
+                    "batch_id": batch["batch_id"],
+                    "generation_index": index,
+                    "created_at": batch["created_at"],
+                    "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
+                    "prompt": _jsonable(_column_item(prompts, index)),
+                    "completion": _jsonable(completion),
+                    "answer": _jsonable(_column_item(columns.get("answer"), index)),
+                    "expected_answer": _jsonable(_column_item(columns.get("expected_answer"), index)),
+                    "task_type": _jsonable(_column_item(columns.get("task_type"), index)),
+                    "target_has_tool_call": _jsonable(_column_item(columns.get("target_has_tool_call"), index)),
+                    "rewards": reward_components,
+                    "weighted_reward": weighted_reward,
+                }
+            )
+        self._append_jsonl(records)
+
+    def _append_jsonl(self, records: list[dict[str, Any]]) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            try:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+
+            try:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+
+
+def generation_log_path(args: argparse.Namespace) -> str:
+    return args.generation_log_file or str(Path(args.output_dir) / "generations.jsonl")
+
+
+def build_reward_funcs(args: argparse.Namespace) -> list[Any]:
+    """Return reward functions, optionally wrapped with generation JSONL logging."""
+    if args.disable_generation_logging:
+        return list(REWARD_FUNCS)
+    logger = GenerationRewardLogger(
+        generation_log_path(args),
+        [reward_func.__name__ for reward_func in REWARD_FUNCS],
+        args.reward_weights,
+    )
+    return [logger.wrap(reward_func) for reward_func in REWARD_FUNCS]
+
+
+def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
+    """Resolve metric sinks from `--report-to` and the convenience `--wandb` flag."""
+    if args.report_to in {None, "", "none"}:
+        report_targets: list[str] = []
+    elif isinstance(args.report_to, str):
+        report_targets = [target.strip() for target in args.report_to.split(",") if target.strip()]
+    else:
+        report_targets = list(args.report_to)
+
+    if args.wandb and "wandb" not in report_targets:
+        report_targets.append("wandb")
+    return report_targets if report_targets else "none"
 
 
 def _model_init_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -120,7 +314,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        report_to=args.report_to,
+        report_to=resolve_report_to(args),
         seed=args.seed,
         use_vllm=args.use_vllm,
         model_init_kwargs=_model_init_kwargs(args),
@@ -135,7 +329,7 @@ def main() -> None:
         processing_class=tokenizer,
         args=training_args,
         train_dataset=dataset,
-        reward_funcs=REWARD_FUNCS,
+        reward_funcs=build_reward_funcs(args),
     )
     trainer.train()
 
