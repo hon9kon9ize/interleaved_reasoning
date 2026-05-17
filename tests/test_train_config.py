@@ -4,6 +4,8 @@ import pytest
 
 from interleaved_grpo.train import (
     GenerationRewardLogger,
+    RewardTimingProfiler,
+    assistant_generation_tail,
     build_grpo_config,
     build_peft_config,
     build_parser,
@@ -17,6 +19,7 @@ from interleaved_grpo.train import (
     resolve_loss_type,
     resolve_reward_weights,
     resolve_report_to,
+    reward_profile_log_path,
     select_reward_funcs,
     supported_init_kwargs,
     trainer_accepts_peft_config,
@@ -35,11 +38,14 @@ def test_train_defaults_match_agentic_reward_suite():
     assert args.filter_overlong_prompts
     assert args.chat_template_enable_thinking is None
     assert args.normalize_prefilled_think
+    assert args.generation_log_prompts
+    assert not args.profile_rewards
     assert not args.use_lora
     assert args.lora_rank == 16
     assert resolve_reward_weights(args, select_reward_funcs(args)) == [1.0, 0.5, 0.3, 1.0]
     assert args.sequential_hybrid_sampler
     assert generation_log_path(args) == "interleaved_grpo_output/generations.jsonl"
+    assert reward_profile_log_path(args) == "interleaved_grpo_output/reward_profile.jsonl"
 
 
 def test_lora_flags_parse_without_enabling_peft_import():
@@ -176,6 +182,18 @@ def test_prefilled_think_completion_normalization_repairs_qwen3_completion():
     assert normalize_prefilled_think_completion("balanced <think>x</think>", completion) == completion
 
 
+def test_prefilled_think_detection_ignores_instructional_tags_before_assistant_tail():
+    prompt = (
+        "<|im_start|>system\nUse <think> to plan. Use <think> to reflect.<|im_end|>\n"
+        "<|im_start|>user\nWrite inside <think>...</think>.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    assert assistant_generation_tail(prompt) == ""
+    assert not prompt_prefills_open_think(prompt)
+    assert normalize_prefilled_think_completion(prompt, "</think><answer>4</answer>") == "</think><answer>4</answer>"
+
+
 def test_reward_wrapper_scores_normalized_prefilled_think_completion():
     def needs_open_think(prompts, completions, **kwargs):
         return [1.0 if completion.startswith("<think>") else 0.0 for completion in completions]
@@ -287,6 +305,9 @@ def test_generation_logger_writes_one_record_per_completion(tmp_path):
         ["completion 1", "completion 2"],
         answer=["4", "5"],
         task_type=["math", "tool"],
+        target_has_tool_call=[False, True],
+        tool_definitions=["[]", '[{"function":{"name":"tool"}}]'],
+        mock_outputs=["{}", '{"sig":"out"}'],
     )
     assert not log_file.exists()
 
@@ -295,6 +316,9 @@ def test_generation_logger_writes_one_record_per_completion(tmp_path):
         ["completion 1", "completion 2"],
         answer=["4", "5"],
         task_type=["math", "tool"],
+        target_has_tool_call=[False, True],
+        tool_definitions=["[]", '[{"function":{"name":"tool"}}]'],
+        mock_outputs=["{}", '{"sig":"out"}'],
     )
 
     records = [json.loads(line) for line in log_file.read_text().splitlines()]
@@ -302,8 +326,44 @@ def test_generation_logger_writes_one_record_per_completion(tmp_path):
     assert records[0]["completion"] == "completion 1"
     assert records[0]["answer"] == "4"
     assert records[0]["task_type"] == "math"
+    assert records[1]["target_has_tool_call"] is True
+    assert records[1]["tool_definitions"] == '[{"function":{"name":"tool"}}]'
+    assert records[1]["mock_outputs"] == '{"sig":"out"}'
     assert records[0]["rewards"] == {"reward_a": 1.0, "reward_b": 0.5}
+    assert set(records[0]["reward_timings_seconds"]) == {"reward_a", "reward_b"}
+    assert records[0]["reward_timings_seconds"]["reward_a"] >= 0.0
     assert records[0]["weighted_reward"] == 2.0
+
+
+def test_generation_logger_can_omit_full_prompts(tmp_path):
+    def reward_a(prompts, completions, **kwargs):
+        return [1.0]
+
+    log_file = tmp_path / "generations.jsonl"
+    logger = GenerationRewardLogger(log_file, ["reward_a"], include_prompts=False)
+
+    logger.wrap(reward_a)(["very long prompt"], ["completion"], answer=["4"])
+
+    record = json.loads(log_file.read_text().splitlines()[0])
+    assert "prompt" not in record
+    assert record["prompt_char_len"] == len("very long prompt")
+    assert len(record["prompt_hash"]) == 32
+
+
+def test_reward_timing_profiler_writes_compact_records(tmp_path, capsys):
+    def reward_a(prompts, completions, **kwargs):
+        return [1.0, 0.0]
+
+    log_file = tmp_path / "reward_profile.jsonl"
+    profiler = RewardTimingProfiler(log_file, print_every=1)
+
+    assert profiler.wrap(reward_a)(["p1", "p2"], ["c1", "c2"]) == [1.0, 0.0]
+
+    record = json.loads(log_file.read_text().splitlines()[0])
+    assert record["reward_name"] == "reward_a"
+    assert record["num_completions"] == 2
+    assert record["elapsed_ms"] >= 0.0
+    assert "[reward-profile" in capsys.readouterr().out
 
 
 def test_sequential_sampler_trainer_preserves_dataset_order():

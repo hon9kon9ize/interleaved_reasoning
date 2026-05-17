@@ -41,7 +41,16 @@ def build_interleaved_messages(
     """Build chat messages that guide the policy toward interleaved reasoning."""
     target_language = reasoning_lang or reasoning_language
     if task_type == "tool":
-        user_content = f"Solve this tool-use task with interleaved plan-action-reflection steps: {question.strip()}"
+        user_content = (
+            "Solve this tool-use task with interleaved plan-action-reflection steps. "
+            "Use <think>...</think> for private planning. "
+            "When taking an action, output exactly one <tool_call>...</tool_call> block containing a single valid JSON "
+            'object with "name" and "arguments" keys, for example '
+            '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>. '
+            "Do not wrap tool calls in <answer>, <action>, markdown, or prose. "
+            "Use <answer>...</answer> only when the task requires a final text answer rather than a tool action. "
+            f"Task: {question.strip()}"
+        )
     elif target_language:
         language = _language_name(target_language or "en")
         user_content = (
@@ -232,9 +241,10 @@ def _alternate_datasets(left: "Dataset", right: "Dataset") -> "Dataset":
     from datasets import Dataset
 
     rows: list[dict[str, object]] = []
+    keys = set(left.column_names) | set(right.column_names)
     for index in range(min(len(left), len(right))):
-        rows.append(dict(left[index]))
-        rows.append(dict(right[index]))
+        rows.append({key: dict(left[index]).get(key) for key in keys})
+        rows.append({key: dict(right[index]).get(key) for key in keys})
     return Dataset.from_list(rows)
 
 
@@ -283,6 +293,7 @@ def _normalize_reasoning_lang(dataset: "Dataset", reasoning_language: str = "yue
             "reasoning_lang": languages,
             "tool_definitions": ["[]" for _ in range(batch_size)],
             "mock_outputs": ["{}" for _ in range(batch_size)],
+            "target_has_tool_call": [False for _ in range(batch_size)],
         }
 
     return dataset.map(process_reasoning_lang, batched=True, remove_columns=dataset.column_names)
@@ -314,6 +325,7 @@ def load_training_dataset(
                 "task_type": ["math"] * len(batch["question"]),
                 "tool_definitions": ["[]" for _ in batch["question"]],
                 "mock_outputs": ["{}" for _ in batch["question"]],
+                "target_has_tool_call": [False for _ in batch["question"]],
             }
 
         dataset = dataset.map(process_gsm8k, batched=True, remove_columns=dataset.column_names)
@@ -327,6 +339,7 @@ def load_training_dataset(
                 "task_type": ["math"] * len(batch["problem"]),
                 "tool_definitions": ["[]" for _ in batch["problem"]],
                 "mock_outputs": ["{}" for _ in batch["problem"]],
+                "target_has_tool_call": [False for _ in batch["problem"]],
             }
 
         dataset = dataset.map(process_math, batched=True, remove_columns=dataset.column_names)

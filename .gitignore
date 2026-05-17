@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 interleaved_grpo_output/
 runs/
+tmp/

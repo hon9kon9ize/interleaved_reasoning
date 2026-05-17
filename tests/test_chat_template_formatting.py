@@ -59,9 +59,10 @@ def test_apply_interleaved_chat_template_formats_prompt():
 
 def test_build_interleaved_messages_for_tool_tasks():
     messages = build_interleaved_messages("Look up the current time.", task_type="tool")
-    assert messages[1]["content"] == (
-        "Solve this tool-use task with interleaved plan-action-reflection steps: Look up the current time."
-    )
+    assert "Solve this tool-use task with interleaved plan-action-reflection steps." in messages[1]["content"]
+    assert '<tool_call>{"name":"tool_name","arguments":{"arg":"value"}}</tool_call>' in messages[1]["content"]
+    assert "Do not wrap tool calls in <answer>, <action>, markdown, or prose." in messages[1]["content"]
+    assert messages[1]["content"].endswith("Task: Look up the current time.")
 
 
 def test_build_interleaved_messages_for_reasoning_language_tasks():

@@ -146,6 +146,12 @@ def test_conditional_step_reward_requires_correct_final_answer():
     assert conditional_step_reward_fn(["q"], [good_structure], answer=["5"]) == [0.0]
 
 
+def test_conditional_step_reward_rejects_empty_thinking_even_when_answer_is_correct():
+    completion = "<think></think><answer>4</answer>"
+
+    assert conditional_step_reward_fn(["q"], [completion], answer=["4"]) == [0.0]
+
+
 def test_conditional_step_reward_uses_tool_simulator_for_tool_tasks():
     completion = (
         '<think>Use calculator now.</think>'

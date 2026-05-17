@@ -211,6 +211,10 @@ def _make_simulator(kwargs: dict[str, Any], index: int) -> InterleavedEnvironmen
     )
 
 
+def _has_nonempty_thinking(stats: dict[str, Any]) -> bool:
+    return any(str(block).strip() for block in stats.get("think_blocks", []))
+
+
 def outcome_correctness_reward_fn(
     prompts: list[str],
     completions: list[str],
@@ -259,6 +263,9 @@ def structural_interleaving_reward_fn(
     for completion in completions:
         stats = parse_interleaved_stream(completion)
         if not stats["is_valid_xml"]:
+            rewards.append(0.0)
+            continue
+        if not _has_nonempty_thinking(stats):
             rewards.append(0.0)
             continue
 
@@ -365,6 +372,9 @@ def conditional_step_reward_fn(
             continue
 
         if not stats["is_valid_xml"]:
+            rewards.append(0.0)
+            continue
+        if not _has_nonempty_thinking(stats):
             rewards.append(0.0)
             continue
 

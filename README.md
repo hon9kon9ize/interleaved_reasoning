@@ -254,7 +254,8 @@ Training writes every generated completion to a JSONL file by default:
 OUTPUT_DIR/generations.jsonl
 ```
 
-Each line includes the prompt, completion, target metadata, reward components, weighted reward, generation index, and process rank.
+Each line includes the prompt, completion, target metadata, reward components, reward timing, weighted reward,
+generation index, and process rank.
 
 Use a custom path:
 
@@ -269,6 +270,21 @@ Disable generation logging:
 ```bash
 python -m interleaved_grpo.train --disable-generation-logging
 ```
+
+On shared filesystems, full ToolMind prompts can make the JSONL large. Keep generation logging but store only a
+prompt hash and character count:
+
+```bash
+python -m interleaved_grpo.train --no-generation-log-prompts
+```
+
+For a compact reward-only timing profile:
+
+```bash
+python -m interleaved_grpo.train --profile-rewards
+```
+
+This writes `OUTPUT_DIR/reward_profile.jsonl` unless `--reward-profile-log-file` is provided.
 
 ## Reward Configuration
 

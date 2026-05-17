@@ -79,9 +79,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL path for generated completions and reward components. Defaults to OUTPUT_DIR/generations.jsonl.",
     )
     parser.add_argument(
+        "--generation-log-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include full prompt text in generation JSONL records. Disable to log only prompt hashes and lengths.",
+    )
+    parser.add_argument(
         "--disable-generation-logging",
         action="store_true",
         help="Disable JSONL logging of generated completions.",
+    )
+    parser.add_argument(
+        "--profile-rewards",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Measure reward function wall-clock time and write a compact JSONL profile.",
+    )
+    parser.add_argument(
+        "--reward-profile-log-file",
+        default=None,
+        help="JSONL path for reward timing profile records. Defaults to OUTPUT_DIR/reward_profile.jsonl.",
     )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
@@ -154,6 +171,11 @@ def _jsonable(value: Any) -> Any:
         return str(value)
 
 
+def _stable_hash(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+
 def make_json_safe(value: Any) -> Any:
     """Recursively convert values to JSON-serializable forms for TrainingArguments."""
     if isinstance(value, dict):
@@ -166,7 +188,24 @@ def make_json_safe(value: Any) -> Any:
 def prompt_prefills_open_think(prompt: Any) -> bool:
     """Return whether a chat template left an opening `<think>` in the prompt."""
     text = "" if prompt is None else str(prompt)
-    return text.count("<think>") > text.count("</think>")
+    assistant_tail = assistant_generation_tail(text)
+    stripped = assistant_tail.lstrip()
+    return stripped.startswith("<think>") and assistant_tail.count("<think>") > assistant_tail.count("</think>")
+
+
+def assistant_generation_tail(prompt: str) -> str:
+    """Return only the generated-assistant prefix of a formatted chat prompt."""
+    markers = (
+        "<|im_start|>assistant\n",
+        "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "<assistant>",
+        "assistant\n",
+    )
+    for marker in markers:
+        index = prompt.rfind(marker)
+        if index >= 0:
+            return prompt[index + len(marker):]
+    return prompt[-256:]
 
 
 def normalize_prefilled_think_completion(prompt: Any, completion: str) -> str:
@@ -220,12 +259,14 @@ class GenerationRewardLogger:
         path: str | Path,
         reward_func_names: list[str],
         reward_weights: list[float] | None = None,
+        include_prompts: bool = True,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.reward_func_names = reward_func_names
         weights = reward_weights or [1.0] * len(reward_func_names)
         self.reward_weights = dict(zip(reward_func_names, weights))
+        self.include_prompts = include_prompts
         self._pending_batches: dict[str, dict[str, Any]] = {}
         self._next_batch_id = 0
 
@@ -234,8 +275,10 @@ class GenerationRewardLogger:
 
         @functools.wraps(reward_func)
         def wrapped(prompts: list[str], completions: list[str], **kwargs: Any) -> list[float]:
+            start = time.perf_counter()
             rewards = reward_func(prompts, completions, **kwargs)
-            self.record(reward_func.__name__, prompts, completions, rewards, kwargs)
+            duration_seconds = time.perf_counter() - start
+            self.record(reward_func.__name__, prompts, completions, rewards, kwargs, duration_seconds)
             return rewards
 
         return wrapped
@@ -247,6 +290,7 @@ class GenerationRewardLogger:
         completions: list[str],
         rewards: list[float],
         kwargs: dict[str, Any],
+        duration_seconds: float | None = None,
     ) -> None:
         prompt_list = _as_list(prompts)
         completion_list = _as_list(completions)
@@ -265,6 +309,8 @@ class GenerationRewardLogger:
                         "expected_answer",
                         "task_type",
                         "target_has_tool_call",
+                        "tool_definitions",
+                        "mock_outputs",
                         "reasoning_lang",
                         "reasoning_language",
                         "language",
@@ -272,11 +318,14 @@ class GenerationRewardLogger:
                     if name in kwargs
                 },
                 "rewards": {},
+                "reward_durations": {},
             }
             self._pending_batches[key] = batch
             self._next_batch_id += 1
 
         batch["rewards"][reward_name] = list(rewards)
+        if duration_seconds is not None:
+            batch["reward_durations"][reward_name] = float(duration_seconds)
         if all(name in batch["rewards"] for name in self.reward_func_names):
             self._flush_batch(batch)
             del self._pending_batches[key]
@@ -290,6 +339,7 @@ class GenerationRewardLogger:
         completions = batch["completions"]
         columns = batch["columns"]
         rewards_by_name = batch["rewards"]
+        reward_durations = batch.get("reward_durations", {})
         records = []
         for index, completion in enumerate(completions):
             reward_components = {
@@ -307,18 +357,29 @@ class GenerationRewardLogger:
                 "generation_index": index,
                 "created_at": batch["created_at"],
                 "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
-                "prompt": _jsonable(prompt),
                 "completion": _jsonable(completion),
                 "answer": _jsonable(_column_item(columns.get("answer"), index)),
                 "expected_answer": _jsonable(_column_item(columns.get("expected_answer"), index)),
                 "task_type": _jsonable(_column_item(columns.get("task_type"), index)),
                 "target_has_tool_call": _jsonable(_column_item(columns.get("target_has_tool_call"), index)),
+                "tool_definitions": _jsonable(_column_item(columns.get("tool_definitions"), index)),
+                "mock_outputs": _jsonable(_column_item(columns.get("mock_outputs"), index)),
                 "reasoning_lang": _jsonable(_column_item(columns.get("reasoning_lang"), index)),
                 "reasoning_language": _jsonable(_column_item(columns.get("reasoning_language"), index)),
                 "language": _jsonable(_column_item(columns.get("language"), index)),
                 "rewards": reward_components,
+                "reward_timings_seconds": {
+                    name: float(duration)
+                    for name, duration in reward_durations.items()
+                },
                 "weighted_reward": weighted_reward,
             }
+            if self.include_prompts:
+                record["prompt"] = _jsonable(prompt)
+            else:
+                prompt_text = "" if prompt is None else str(prompt)
+                record["prompt_hash"] = _stable_hash(prompt_text)
+                record["prompt_char_len"] = len(prompt_text)
             normalized_completion = normalize_prefilled_think_completion(prompt, completion)
             if normalized_completion != completion:
                 record["normalized_completion"] = _jsonable(normalized_completion)
@@ -346,8 +407,59 @@ class GenerationRewardLogger:
                 pass
 
 
+class RewardTimingProfiler:
+    """Write compact timing records for reward functions."""
+
+    def __init__(self, path: str | Path, print_every: int = 10) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.print_every = max(print_every, 1)
+        self._stats: dict[str, dict[str, float]] = {}
+
+    def wrap(self, reward_func: Any) -> Any:
+        @functools.wraps(reward_func)
+        def wrapped(prompts: list[str], completions: list[str], **kwargs: Any) -> list[float]:
+            start = time.perf_counter()
+            rewards = reward_func(prompts, completions, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            self.record(reward_func.__name__, elapsed_ms, len(_as_list(completions)))
+            return rewards
+
+        return wrapped
+
+    def record(self, reward_name: str, elapsed_ms: float, num_completions: int) -> None:
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        record = {
+            "created_at": time.time(),
+            "process_rank": rank,
+            "reward_name": reward_name,
+            "elapsed_ms": elapsed_ms,
+            "num_completions": num_completions,
+            "ms_per_completion": elapsed_ms / max(num_completions, 1),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+
+        stats = self._stats.setdefault(reward_name, {"calls": 0.0, "elapsed_ms": 0.0, "num_completions": 0.0})
+        stats["calls"] += 1.0
+        stats["elapsed_ms"] += elapsed_ms
+        stats["num_completions"] += float(num_completions)
+        if int(stats["calls"]) % self.print_every == 0:
+            avg_batch_ms = stats["elapsed_ms"] / stats["calls"]
+            avg_item_ms = stats["elapsed_ms"] / max(stats["num_completions"], 1.0)
+            print(
+                f"[reward-profile rank={rank}] {reward_name}: "
+                f"avg_batch_ms={avg_batch_ms:.3f} avg_item_ms={avg_item_ms:.3f} calls={int(stats['calls'])}"
+            )
+
+
 def generation_log_path(args: argparse.Namespace) -> str:
     return args.generation_log_file or str(Path(args.output_dir) / "generations.jsonl")
+
+
+def reward_profile_log_path(args: argparse.Namespace) -> str:
+    return args.reward_profile_log_file or str(Path(args.output_dir) / "reward_profile.jsonl")
 
 
 def dataset_has_reasoning_lang(dataset: Any) -> bool:
@@ -394,12 +506,16 @@ def build_reward_funcs(
         with_prefilled_think_normalization(reward_func, enabled=args.normalize_prefilled_think)
         for reward_func in reward_funcs
     ]
+    if args.profile_rewards:
+        profiler = RewardTimingProfiler(reward_profile_log_path(args), print_every=args.logging_steps)
+        reward_funcs = [profiler.wrap(reward_func) for reward_func in reward_funcs]
     if args.disable_generation_logging:
         return list(reward_funcs)
     logger = GenerationRewardLogger(
         generation_log_path(args),
         [reward_func.__name__ for reward_func in reward_funcs],
         reward_weights,
+        include_prompts=args.generation_log_prompts,
     )
     return [logger.wrap(reward_func) for reward_func in reward_funcs]
 
@@ -486,6 +602,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace, reward_weights: list[floa
         "temperature": args.temperature,
         "beta": args.beta,
         "reward_weights": reward_weights,
+        "remove_unused_columns": False,
         "bf16": args.bf16,
         "gradient_checkpointing": args.gradient_checkpointing,
         "logging_steps": args.logging_steps,
