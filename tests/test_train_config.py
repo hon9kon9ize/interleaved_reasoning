@@ -2,12 +2,15 @@ import json
 
 from interleaved_grpo.train import (
     GenerationRewardLogger,
+    build_peft_config,
     build_parser,
+    build_trainer_model_kwargs,
     dataset_has_reasoning_lang,
     generation_log_path,
     resolve_reward_weights,
     resolve_report_to,
     select_reward_funcs,
+    trainer_accepts_peft_config,
     with_sequential_train_sampler,
 )
 
@@ -17,9 +20,57 @@ def test_train_defaults_match_agentic_reward_suite():
 
     assert args.beta == 0.01
     assert args.num_generations == 4
+    assert not args.use_lora
+    assert args.lora_rank == 16
     assert resolve_reward_weights(args, select_reward_funcs(args)) == [1.0, 0.5, 0.3, 1.0]
     assert args.sequential_hybrid_sampler
     assert generation_log_path(args) == "interleaved_grpo_output/generations.jsonl"
+
+
+def test_lora_flags_parse_without_enabling_peft_import():
+    args = build_parser().parse_args(
+        [
+            "--use-lora",
+            "--lora-rank",
+            "8",
+            "--lora-alpha",
+            "16",
+            "--lora-dropout",
+            "0.1",
+            "--lora-target-modules",
+            "q_proj,v_proj",
+            "--lora-modules-to-save",
+            "lm_head",
+        ]
+    )
+
+    assert args.use_lora
+    assert args.lora_rank == 8
+    assert args.lora_alpha == 16
+    assert args.lora_dropout == 0.1
+    assert args.lora_target_modules == "q_proj,v_proj"
+    assert args.lora_modules_to_save == "lm_head"
+
+
+def test_build_peft_config_disabled_does_not_require_peft():
+    args = build_parser().parse_args([])
+
+    assert build_peft_config(args) is None
+
+
+def test_build_trainer_model_kwargs_passes_peft_config_when_supported():
+    class FakeTrainerWithPeft:
+        def __init__(self, model, peft_config=None):
+            pass
+
+    args = build_parser().parse_args(["--model-id", "test/model"])
+    peft_config = object()
+
+    assert trainer_accepts_peft_config(FakeTrainerWithPeft)
+    assert build_trainer_model_kwargs(args, FakeTrainerWithPeft, peft_config) == {
+        "model": "test/model",
+        "peft_config": peft_config,
+    }
 
 
 def test_reasoning_lang_selects_language_reward():

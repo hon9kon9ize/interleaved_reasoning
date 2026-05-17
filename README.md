@@ -27,6 +27,7 @@ The pipeline trains a model to alternate between private planning and observable
 - Hugging Face access to the selected base model and datasets.
 - Optional but recommended: set `HF_TOKEN` for higher Hugging Face Hub rate limits.
 - Optional: `vllm` for faster generation rollouts.
+- Optional but recommended: LoRA adapter training through `peft` with `--use-lora`.
 - Optional: a Weights & Biases account if using `--wandb`.
 
 Create and install the environment:
@@ -168,6 +169,22 @@ python -m interleaved_grpo.train \
   --num-generations 4
 ```
 
+Train with LoRA adapters:
+
+```bash
+python -m interleaved_grpo.train \
+  --model-id Qwen/Qwen2.5-7B-Instruct \
+  --dataset hybrid \
+  --max-samples 10000 \
+  --output-dir ./runs/hybrid_lora \
+  --use-lora \
+  --lora-rank 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --lora-target-modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+  --num-generations 4
+```
+
 Train on Cantonese reasoning-language math:
 
 ```bash
@@ -195,6 +212,18 @@ With vLLM enabled:
 
 ```bash
 USE_VLLM=1 DATASET=hybrid MAX_SAMPLES=10000 bash interleaved_grpo/run_training.sh
+```
+
+With LoRA enabled through the launcher:
+
+```bash
+USE_LORA=1 \
+LORA_RANK=16 \
+LORA_ALPHA=32 \
+DATASET=hybrid \
+MAX_SAMPLES=10000 \
+OUTPUT_DIR=./runs/hybrid_lora \
+bash interleaved_grpo/run_training.sh
 ```
 
 The launcher uses `accelerate launch` locally and switches to `srun accelerate launch` when `SLURM_JOB_ID` is present.
@@ -277,6 +306,8 @@ The language reward uses `cantofilter` when installed for Cantonese detection, w
 
 - `num_generations` is the GRPO group size. The default is `4`; override it with `--num-generations`.
 - `--beta 0.01` is the default KL coefficient.
+- `--use-lora` trains PEFT LoRA adapters instead of all model weights. Defaults are rank `16`, alpha `32`, dropout `0.05`, and Qwen/Llama-style attention plus MLP target modules.
+- `--lora-target-modules` accepts a comma-separated list; adjust it if your base model uses different projection module names.
 - `--sequential-hybrid-sampler` is enabled by default so hybrid rows preserve the alternating math/tool order.
 - Do not launch a full 7B run until parser, reward, and dataset smoke tests pass.
 - TensorBoard logs are written when `--report-to tensorboard` is active. W&B is enabled with `--wandb`.

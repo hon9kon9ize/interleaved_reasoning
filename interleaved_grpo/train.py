@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import functools
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-vllm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--use-lora", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora-target-modules",
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help="Comma-separated module names to adapt with LoRA.",
+    )
+    parser.add_argument("--lora-bias", choices=["none", "all", "lora_only"], default="none")
+    parser.add_argument(
+        "--lora-modules-to-save",
+        default=None,
+        help="Optional comma-separated module names to save alongside LoRA adapters.",
+    )
     parser.add_argument("--sequential-hybrid-sampler", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--language-consistency-reward",
@@ -313,6 +329,69 @@ def _model_init_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return kwargs
 
 
+def _split_csv_arg(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def build_peft_config(args: argparse.Namespace) -> Any | None:
+    """Build a PEFT LoRA config when requested."""
+    if not args.use_lora:
+        return None
+
+    try:
+        from peft import LoraConfig
+    except ImportError as exc:
+        raise ImportError("LoRA support requires `peft`. Install it with `python -m pip install peft`.") from exc
+
+    target_modules = _split_csv_arg(args.lora_target_modules)
+    if not target_modules:
+        raise ValueError("--lora-target-modules must include at least one module name when --use-lora is enabled.")
+
+    modules_to_save = _split_csv_arg(args.lora_modules_to_save)
+    return LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
+        modules_to_save=modules_to_save,
+    )
+
+
+def trainer_accepts_peft_config(trainer_cls: Any) -> bool:
+    """Return whether the installed TRL trainer can receive `peft_config` directly."""
+    try:
+        return "peft_config" in inspect.signature(trainer_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def build_trainer_model_kwargs(
+    args: argparse.Namespace,
+    trainer_cls: Any,
+    peft_config: Any | None,
+) -> dict[str, Any]:
+    """Build model-related kwargs for GRPOTrainer with portable LoRA support."""
+    if peft_config is None:
+        return {"model": args.model_id}
+
+    if trainer_accepts_peft_config(trainer_cls):
+        return {"model": args.model_id, "peft_config": peft_config}
+
+    try:
+        from peft import get_peft_model
+        from transformers import AutoModelForCausalLM
+    except ImportError as exc:
+        raise ImportError("Fallback LoRA model wrapping requires `peft` and `transformers`.") from exc
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, **_model_init_kwargs(args))
+    return {"model": get_peft_model(model, peft_config)}
+
+
 def with_sequential_train_sampler(trainer_cls: Any) -> Any:
     """Return a trainer subclass that preserves dataset order for alternating hybrid rows."""
 
@@ -385,6 +464,7 @@ def main() -> None:
     dataset = apply_interleaved_chat_template(dataset_from_args(args), tokenizer, default_reasoning_lang=args.reasoning_lang)
     reward_funcs = select_reward_funcs(args, dataset)
     reward_weights = resolve_reward_weights(args, reward_funcs)
+    peft_config = build_peft_config(args)
 
     training_args = GRPOConfig(
         output_dir=args.output_dir,
@@ -412,9 +492,10 @@ def main() -> None:
     trainer_cls = GRPOTrainer
     if args.dataset == "hybrid" and args.sequential_hybrid_sampler:
         trainer_cls = with_sequential_train_sampler(GRPOTrainer)
+    model_kwargs = build_trainer_model_kwargs(args, trainer_cls, peft_config)
 
     trainer = trainer_cls(
-        model=args.model_id,
+        **model_kwargs,
         processing_class=tokenizer,
         args=training_args,
         train_dataset=dataset,

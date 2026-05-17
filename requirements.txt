@@ -1,5 +1,6 @@
 accelerate
 datasets
+peft
 pytest
 sympy
 tensorboard

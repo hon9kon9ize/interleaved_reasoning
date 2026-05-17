@@ -31,6 +31,18 @@ if [[ "${USE_VLLM:-0}" == "1" ]]; then
   ARGS+=(--use-vllm)
 fi
 
+if [[ "${USE_LORA:-0}" == "1" ]]; then
+  ARGS+=(--use-lora)
+  ARGS+=(--lora-rank "${LORA_RANK:-16}")
+  ARGS+=(--lora-alpha "${LORA_ALPHA:-32}")
+  ARGS+=(--lora-dropout "${LORA_DROPOUT:-0.05}")
+  ARGS+=(--lora-target-modules "${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}")
+  ARGS+=(--lora-bias "${LORA_BIAS:-none}")
+  if [[ -n "${LORA_MODULES_TO_SAVE:-}" ]]; then
+    ARGS+=(--lora-modules-to-save "${LORA_MODULES_TO_SAVE}")
+  fi
+fi
+
 if [[ "${WANDB:-0}" == "1" ]]; then
   ARGS+=(--wandb)
 fi
