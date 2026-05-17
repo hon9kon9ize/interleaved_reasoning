@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields, is_dataclass
 import functools
 import hashlib
 import inspect
@@ -55,6 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-completion-length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--beta", type=float, default=0.01)
+    parser.add_argument(
+        "--loss-type",
+        choices=["grpo", "dapo", "dr_grpo", "bnpo", "cispo", "sapo", "luspo"],
+        default=None,
+        help="Optional TRL GRPO loss formulation. Leave unset to use the installed TRL default.",
+    )
+    parser.add_argument(
+        "--dapo",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Shortcut for --loss-type dapo when supported by the installed TRL version.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
@@ -396,6 +409,99 @@ def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
     return report_targets if report_targets else "none"
 
 
+def resolve_loss_type(args: argparse.Namespace) -> str | None:
+    """Resolve DAPO shortcut and explicit loss-type settings."""
+    if args.dapo:
+        if args.loss_type not in {None, "dapo"}:
+            raise ValueError("--dapo cannot be combined with a different --loss-type.")
+        return "dapo"
+    return args.loss_type
+
+
+def supported_init_kwargs(config_cls: Any) -> set[str] | None:
+    """Return accepted `__init__` kwargs, or None when the class accepts arbitrary kwargs."""
+    try:
+        signature = inspect.signature(config_cls.__init__)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None:
+        supported: set[str] = set()
+        for name, parameter in signature.parameters.items():
+            if name == "self":
+                continue
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                return None
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }:
+                supported.add(name)
+        if supported:
+            return supported
+
+    if is_dataclass(config_cls):
+        return {field.name for field in fields(config_cls)}
+    return None
+
+
+def filter_supported_init_kwargs(
+    config_cls: Any,
+    kwargs: dict[str, Any],
+    object_name: str,
+) -> dict[str, Any]:
+    """Drop kwargs unsupported by the installed dependency version."""
+    supported = supported_init_kwargs(config_cls)
+    if supported is None:
+        return kwargs
+
+    filtered = {name: value for name, value in kwargs.items() if name in supported}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        print(f"{object_name} does not support these arguments; ignoring them: {', '.join(dropped)}")
+    return filtered
+
+
+def build_grpo_config_kwargs(args: argparse.Namespace, reward_weights: list[float]) -> dict[str, Any]:
+    """Collect desired GRPOConfig kwargs before version-compatibility filtering."""
+    kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_steps,
+        "num_generations": args.num_generations,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "temperature": args.temperature,
+        "beta": args.beta,
+        "reward_weights": reward_weights,
+        "bf16": args.bf16,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "report_to": resolve_report_to(args),
+        "seed": args.seed,
+        "use_vllm": args.use_vllm,
+        "model_init_kwargs": _model_init_kwargs(args),
+    }
+    loss_type = resolve_loss_type(args)
+    if loss_type is not None:
+        kwargs["loss_type"] = loss_type
+    return kwargs
+
+
+def build_grpo_config(config_cls: Any, args: argparse.Namespace, reward_weights: list[float]) -> Any:
+    """Build GRPOConfig across TRL versions with different constructor signatures."""
+    kwargs = build_grpo_config_kwargs(args, reward_weights)
+    supported = supported_init_kwargs(config_cls)
+    if supported is not None and "max_completion_length" not in supported and "generation_kwargs" in supported:
+        kwargs["generation_kwargs"] = {"max_new_tokens": args.max_completion_length}
+    filtered = filter_supported_init_kwargs(config_cls, kwargs, "GRPOConfig")
+    return config_cls(**filtered)
+
+
 def _model_init_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
@@ -609,28 +715,7 @@ def main() -> None:
     reward_weights = resolve_reward_weights(args, reward_funcs)
     peft_config = build_peft_config(args)
 
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        max_steps=args.max_steps,
-        num_generations=args.num_generations,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        temperature=args.temperature,
-        beta=args.beta,
-        reward_weights=reward_weights,
-        bf16=args.bf16,
-        gradient_checkpointing=args.gradient_checkpointing,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        report_to=resolve_report_to(args),
-        seed=args.seed,
-        use_vllm=args.use_vllm,
-        model_init_kwargs=_model_init_kwargs(args),
-    )
+    training_args = build_grpo_config(GRPOConfig, args, reward_weights)
 
     trainer_cls = GRPOTrainer
     if args.dataset == "hybrid" and args.sequential_hybrid_sampler:

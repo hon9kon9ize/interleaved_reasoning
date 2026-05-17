@@ -147,6 +147,7 @@ python -m interleaved_grpo.train \
   --output-dir ./runs/toolmind_interleaved \
   --max-prompt-length 4096 \
   --max-completion-length 2048 \
+  --dapo \
   --num-generations 4
 ```
 
@@ -308,6 +309,7 @@ The language reward uses `cantofilter` when installed for Cantonese detection, w
 
 - `num_generations` is the GRPO group size. The default is `4`; override it with `--num-generations`.
 - `--beta 0.01` is the default KL coefficient.
+- `--dapo` is a shortcut for `--loss-type dapo`, which asks TRL to use DAPO token-level loss normalization when the installed TRL version supports `loss_type`. Use `--loss-type grpo|dapo|dr_grpo|bnpo|cispo|sapo|luspo` for explicit variants.
 - `--filter-overlong-prompts` is enabled by default and drops formatted rows whose tokenized prompt exceeds `--max-prompt-length`. Use `--no-filter-overlong-prompts` to keep TRL's truncation behavior.
 - For ToolMind with Qwen2.5 chat formatting, `--max-prompt-length 4096 --max-completion-length 2048` covers roughly 97% of rows. Use `6144/4096` for roughly 99.6% coverage if memory allows.
 - Qwen3 thinking templates can prefill the opening `<think>` inside the prompt, so generated completions may start with thought text or `</think>` instead of a literal opening tag. `--normalize-prefilled-think` is enabled by default and prepends that missing opening tag back before reward parsing. Use `--no-normalize-prefilled-think` to disable it.

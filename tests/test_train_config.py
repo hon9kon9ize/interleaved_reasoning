@@ -4,6 +4,7 @@ import pytest
 
 from interleaved_grpo.train import (
     GenerationRewardLogger,
+    build_grpo_config,
     build_peft_config,
     build_parser,
     build_trainer_model_kwargs,
@@ -12,9 +13,11 @@ from interleaved_grpo.train import (
     generation_log_path,
     normalize_prefilled_think_completion,
     prompt_prefills_open_think,
+    resolve_loss_type,
     resolve_reward_weights,
     resolve_report_to,
     select_reward_funcs,
+    supported_init_kwargs,
     trainer_accepts_peft_config,
     with_prefilled_think_normalization,
     with_sequential_train_sampler,
@@ -26,6 +29,8 @@ def test_train_defaults_match_agentic_reward_suite():
 
     assert args.beta == 0.01
     assert args.num_generations == 4
+    assert args.loss_type is None
+    assert not args.dapo
     assert args.filter_overlong_prompts
     assert args.chat_template_enable_thinking is None
     assert args.normalize_prefilled_think
@@ -80,6 +85,58 @@ def test_build_trainer_model_kwargs_passes_peft_config_when_supported():
         "model": "test/model",
         "peft_config": peft_config,
     }
+
+
+def test_build_grpo_config_ignores_unsupported_trl_kwargs(monkeypatch, capsys):
+    class OldGRPOConfig:
+        def __init__(self, output_dir, learning_rate, generation_kwargs=None):
+            self.output_dir = output_dir
+            self.learning_rate = learning_rate
+            self.generation_kwargs = generation_kwargs
+
+    monkeypatch.setattr("interleaved_grpo.train._model_init_kwargs", lambda args: {"torch_dtype": "bf16"})
+    args = build_parser().parse_args(
+        [
+            "--output-dir",
+            "runs/test",
+            "--learning-rate",
+            "1e-5",
+            "--max-prompt-length",
+            "4096",
+            "--max-completion-length",
+            "2048",
+        ]
+    )
+
+    config = build_grpo_config(OldGRPOConfig, args, [1.0])
+
+    assert supported_init_kwargs(OldGRPOConfig) == {"output_dir", "learning_rate", "generation_kwargs"}
+    assert config.output_dir == "runs/test"
+    assert config.learning_rate == 1e-5
+    assert config.generation_kwargs == {"max_new_tokens": 2048}
+    assert "max_prompt_length" in capsys.readouterr().out
+
+
+def test_dapo_flag_resolves_loss_type_and_passes_supported_config(monkeypatch):
+    class GRPOConfigWithLossType:
+        def __init__(self, output_dir, loss_type=None):
+            self.output_dir = output_dir
+            self.loss_type = loss_type
+
+    monkeypatch.setattr("interleaved_grpo.train._model_init_kwargs", lambda args: {"torch_dtype": "bf16"})
+    args = build_parser().parse_args(["--dapo"])
+
+    config = build_grpo_config(GRPOConfigWithLossType, args, [1.0])
+
+    assert resolve_loss_type(args) == "dapo"
+    assert config.loss_type == "dapo"
+
+
+def test_dapo_rejects_conflicting_loss_type():
+    args = build_parser().parse_args(["--dapo", "--loss-type", "grpo"])
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_loss_type(args)
 
 
 def test_prefilled_think_completion_normalization_repairs_qwen3_completion():

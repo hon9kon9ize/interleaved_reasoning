@@ -28,6 +28,14 @@ if [[ -n "${REASONING_LANG:-}" ]]; then
   ARGS+=(--reasoning-lang "${REASONING_LANG}")
 fi
 
+if [[ -n "${LOSS_TYPE:-}" ]]; then
+  ARGS+=(--loss-type "${LOSS_TYPE}")
+fi
+
+if [[ "${DAPO:-0}" == "1" ]]; then
+  ARGS+=(--dapo)
+fi
+
 if [[ "${FILTER_OVERLONG_PROMPTS:-1}" != "1" ]]; then
   ARGS+=(--no-filter-overlong-prompts)
 fi
