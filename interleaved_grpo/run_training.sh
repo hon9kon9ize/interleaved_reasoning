@@ -32,6 +32,18 @@ if [[ "${FILTER_OVERLONG_PROMPTS:-1}" != "1" ]]; then
   ARGS+=(--no-filter-overlong-prompts)
 fi
 
+if [[ -n "${CHAT_TEMPLATE_ENABLE_THINKING:-}" ]]; then
+  if [[ "${CHAT_TEMPLATE_ENABLE_THINKING}" == "1" ]]; then
+    ARGS+=(--chat-template-enable-thinking)
+  else
+    ARGS+=(--no-chat-template-enable-thinking)
+  fi
+fi
+
+if [[ "${NORMALIZE_PREFILLED_THINK:-1}" != "1" ]]; then
+  ARGS+=(--no-normalize-prefilled-think)
+fi
+
 if [[ "${USE_VLLM:-0}" == "1" ]]; then
   ARGS+=(--use-vllm)
 fi

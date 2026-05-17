@@ -310,6 +310,8 @@ The language reward uses `cantofilter` when installed for Cantonese detection, w
 - `--beta 0.01` is the default KL coefficient.
 - `--filter-overlong-prompts` is enabled by default and drops formatted rows whose tokenized prompt exceeds `--max-prompt-length`. Use `--no-filter-overlong-prompts` to keep TRL's truncation behavior.
 - For ToolMind with Qwen2.5 chat formatting, `--max-prompt-length 4096 --max-completion-length 2048` covers roughly 97% of rows. Use `6144/4096` for roughly 99.6% coverage if memory allows.
+- Qwen3 thinking templates can prefill the opening `<think>` inside the prompt, so generated completions may start with thought text or `</think>` instead of a literal opening tag. `--normalize-prefilled-think` is enabled by default and prepends that missing opening tag back before reward parsing. Use `--no-normalize-prefilled-think` to disable it.
+- `--chat-template-enable-thinking` and `--no-chat-template-enable-thinking` optionally pass `enable_thinking` to `tokenizer.apply_chat_template`. By default the argument is omitted so each tokenizer keeps its native template behavior.
 - `--use-lora` trains PEFT LoRA adapters instead of all model weights. Defaults are rank `16`, alpha `32`, dropout `0.05`, and Qwen/Llama-style attention plus MLP target modules.
 - `--lora-target-modules` accepts a comma-separated list; adjust it if your base model uses different projection module names.
 - `--sequential-hybrid-sampler` is enabled by default so hybrid rows preserve the alternating math/tool order.

@@ -10,10 +10,13 @@ from interleaved_grpo.train import (
     dataset_has_reasoning_lang,
     filter_overlong_prompts,
     generation_log_path,
+    normalize_prefilled_think_completion,
+    prompt_prefills_open_think,
     resolve_reward_weights,
     resolve_report_to,
     select_reward_funcs,
     trainer_accepts_peft_config,
+    with_prefilled_think_normalization,
     with_sequential_train_sampler,
 )
 
@@ -24,6 +27,8 @@ def test_train_defaults_match_agentic_reward_suite():
     assert args.beta == 0.01
     assert args.num_generations == 4
     assert args.filter_overlong_prompts
+    assert args.chat_template_enable_thinking is None
+    assert args.normalize_prefilled_think
     assert not args.use_lora
     assert args.lora_rank == 16
     assert resolve_reward_weights(args, select_reward_funcs(args)) == [1.0, 0.5, 0.3, 1.0]
@@ -75,6 +80,25 @@ def test_build_trainer_model_kwargs_passes_peft_config_when_supported():
         "model": "test/model",
         "peft_config": peft_config,
     }
+
+
+def test_prefilled_think_completion_normalization_repairs_qwen3_completion():
+    prompt = "<|im_start|>assistant\n<think>\n"
+    completion = "Plan briefly.</think><answer>4</answer>"
+
+    assert prompt_prefills_open_think(prompt)
+    assert normalize_prefilled_think_completion(prompt, completion) == "<think>Plan briefly.</think><answer>4</answer>"
+    assert normalize_prefilled_think_completion(prompt, "<think>Already tagged.</think>") == "<think>Already tagged.</think>"
+    assert normalize_prefilled_think_completion("balanced <think>x</think>", completion) == completion
+
+
+def test_reward_wrapper_scores_normalized_prefilled_think_completion():
+    def needs_open_think(prompts, completions, **kwargs):
+        return [1.0 if completion.startswith("<think>") else 0.0 for completion in completions]
+
+    wrapped = with_prefilled_think_normalization(needs_open_think)
+
+    assert wrapped(["assistant\n<think>\n"], ["Plan.</think>"]) == [1.0]
 
 
 def test_filter_overlong_prompts_drops_rows_by_tokenized_prompt_length():

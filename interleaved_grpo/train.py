@@ -40,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Drop formatted training rows whose prompt token length exceeds --max-prompt-length.",
     )
+    parser.add_argument(
+        "--chat-template-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional passthrough for tokenizer.apply_chat_template(enable_thinking=...). Defaults to omitting it.",
+    )
+    parser.add_argument(
+        "--normalize-prefilled-think",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="For templates that prefill an opening <think>, prepend it back to completions before reward scoring.",
+    )
     parser.add_argument("--max-completion-length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--beta", type=float, default=0.01)
@@ -127,6 +139,55 @@ def _jsonable(value: Any) -> Any:
         return value
     except TypeError:
         return str(value)
+
+
+def prompt_prefills_open_think(prompt: Any) -> bool:
+    """Return whether a chat template left an opening `<think>` in the prompt."""
+    text = "" if prompt is None else str(prompt)
+    return text.count("<think>") > text.count("</think>")
+
+
+def normalize_prefilled_think_completion(prompt: Any, completion: str) -> str:
+    """
+    Reconstruct a Qwen-style prefilled opening `<think>` for reward parsing.
+
+    Some Qwen3 thinking templates append `<think>` to the generation prompt. TRL
+    only passes generated tokens to reward functions, so the completion can start
+    with thought text or `</think>` and otherwise look like malformed XML.
+    """
+    if not prompt_prefills_open_think(prompt):
+        return completion
+    if completion.lstrip().startswith("<think>"):
+        return completion
+    return "<think>" + completion
+
+
+def normalize_prefilled_think_completions(
+    prompts: list[Any],
+    completions: list[str],
+    enabled: bool = True,
+) -> list[str]:
+    """Normalize a batch of completions for templates that prefilled `<think>`."""
+    if not enabled:
+        return list(completions)
+    if len(prompts) == len(completions):
+        return [normalize_prefilled_think_completion(prompt, completion) for prompt, completion in zip(prompts, completions)]
+    if len(prompts) == 1:
+        return [normalize_prefilled_think_completion(prompts[0], completion) for completion in completions]
+    return list(completions)
+
+
+def with_prefilled_think_normalization(reward_func: Any, enabled: bool = True) -> Any:
+    """Wrap a reward function so Qwen3 prefilled think prompts parse correctly."""
+
+    @functools.wraps(reward_func)
+    def wrapped(prompts: list[str], completions: list[str], **kwargs: Any) -> list[float]:
+        prompt_list = _as_list(prompts)
+        completion_list = _as_list(completions)
+        normalized = normalize_prefilled_think_completions(prompt_list, completion_list, enabled=enabled)
+        return reward_func(prompts, normalized, **kwargs)
+
+    return wrapped
 
 
 class GenerationRewardLogger:
@@ -218,25 +279,28 @@ class GenerationRewardLogger:
                 reward * self.reward_weights.get(name, 1.0)
                 for name, reward in reward_components.items()
             )
-            records.append(
-                {
-                    "batch_id": batch["batch_id"],
-                    "generation_index": index,
-                    "created_at": batch["created_at"],
-                    "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
-                    "prompt": _jsonable(_column_item(prompts, index)),
-                    "completion": _jsonable(completion),
-                    "answer": _jsonable(_column_item(columns.get("answer"), index)),
-                    "expected_answer": _jsonable(_column_item(columns.get("expected_answer"), index)),
-                    "task_type": _jsonable(_column_item(columns.get("task_type"), index)),
-                    "target_has_tool_call": _jsonable(_column_item(columns.get("target_has_tool_call"), index)),
-                    "reasoning_lang": _jsonable(_column_item(columns.get("reasoning_lang"), index)),
-                    "reasoning_language": _jsonable(_column_item(columns.get("reasoning_language"), index)),
-                    "language": _jsonable(_column_item(columns.get("language"), index)),
-                    "rewards": reward_components,
-                    "weighted_reward": weighted_reward,
-                }
-            )
+            prompt = _column_item(prompts, index)
+            record = {
+                "batch_id": batch["batch_id"],
+                "generation_index": index,
+                "created_at": batch["created_at"],
+                "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
+                "prompt": _jsonable(prompt),
+                "completion": _jsonable(completion),
+                "answer": _jsonable(_column_item(columns.get("answer"), index)),
+                "expected_answer": _jsonable(_column_item(columns.get("expected_answer"), index)),
+                "task_type": _jsonable(_column_item(columns.get("task_type"), index)),
+                "target_has_tool_call": _jsonable(_column_item(columns.get("target_has_tool_call"), index)),
+                "reasoning_lang": _jsonable(_column_item(columns.get("reasoning_lang"), index)),
+                "reasoning_language": _jsonable(_column_item(columns.get("reasoning_language"), index)),
+                "language": _jsonable(_column_item(columns.get("language"), index)),
+                "rewards": reward_components,
+                "weighted_reward": weighted_reward,
+            }
+            normalized_completion = normalize_prefilled_think_completion(prompt, completion)
+            if normalized_completion != completion:
+                record["normalized_completion"] = _jsonable(normalized_completion)
+            records.append(record)
         self._append_jsonl(records)
 
     def _append_jsonl(self, records: list[dict[str, Any]]) -> None:
@@ -304,6 +368,10 @@ def build_reward_funcs(
     """Return reward functions, optionally wrapped with generation JSONL logging."""
     reward_funcs = reward_funcs or select_reward_funcs(args)
     reward_weights = reward_weights or resolve_reward_weights(args, reward_funcs)
+    reward_funcs = [
+        with_prefilled_think_normalization(reward_func, enabled=args.normalize_prefilled_think)
+        for reward_func in reward_funcs
+    ]
     if args.disable_generation_logging:
         return list(reward_funcs)
     logger = GenerationRewardLogger(
@@ -416,6 +484,7 @@ def apply_interleaved_chat_template(
     dataset: Any,
     tokenizer: Any,
     default_reasoning_lang: str | None = None,
+    chat_template_enable_thinking: bool | None = None,
 ) -> Any:
     """Convert normalized questions into chat-template prompts for GRPO."""
 
@@ -432,14 +501,14 @@ def apply_interleaved_chat_template(
                 for value in reasoning_langs
             ]
         prompts = [
-            tokenizer.apply_chat_template(
+            apply_chat_template_text(
+                tokenizer,
                 build_interleaved_messages(
                     question,
                     task_type=task_type,
                     reasoning_lang=reasoning_lang,
                 ),
-                tokenize=False,
-                add_generation_prompt=True,
+                enable_thinking=chat_template_enable_thinking,
             )
             for question, task_type, reasoning_lang in zip(examples["question"], task_types, reasoning_langs)
         ]
@@ -455,6 +524,23 @@ def apply_interleaved_chat_template(
         return processed
 
     return dataset.map(process_data, batched=True, remove_columns=dataset.column_names)
+
+
+def apply_chat_template_text(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    enable_thinking: bool | None = None,
+) -> str:
+    """Apply the tokenizer chat template with optional Qwen thinking-mode passthrough."""
+    kwargs: dict[str, Any] = {}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **kwargs,
+    )
 
 
 def _prompt_token_lengths(tokenizer: Any, prompts: list[str]) -> list[int]:
@@ -507,7 +593,12 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = apply_interleaved_chat_template(dataset_from_args(args), tokenizer, default_reasoning_lang=args.reasoning_lang)
+    dataset = apply_interleaved_chat_template(
+        dataset_from_args(args),
+        tokenizer,
+        default_reasoning_lang=args.reasoning_lang,
+        chat_template_enable_thinking=args.chat_template_enable_thinking,
+    )
     dataset = filter_overlong_prompts(
         dataset,
         tokenizer,

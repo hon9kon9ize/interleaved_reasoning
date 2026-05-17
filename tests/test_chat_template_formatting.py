@@ -24,7 +24,11 @@ class FakeDataset:
 
 
 class FakeTokenizer:
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def __init__(self):
+        self.kwargs = None
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
+        self.kwargs = kwargs
         assert not tokenize
         assert add_generation_prompt
         assert messages[0]["role"] == "system"
@@ -73,3 +77,12 @@ def test_apply_interleaved_chat_template_uses_default_reasoning_lang():
 
     assert formatted["reasoning_lang"] == ["yue"]
     assert "in Cantonese" in formatted["prompt"][0]
+
+
+def test_apply_interleaved_chat_template_can_pass_qwen_thinking_flag():
+    tokenizer = FakeTokenizer()
+    dataset = FakeDataset([{"question": "What is 2+2?", "answer": "4"}])
+
+    apply_interleaved_chat_template(dataset, tokenizer, chat_template_enable_thinking=False)
+
+    assert tokenizer.kwargs == {"enable_thinking": False}
