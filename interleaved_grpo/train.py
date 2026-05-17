@@ -576,12 +576,13 @@ def with_sequential_train_sampler(trainer_cls: Any) -> Any:
     """Return a trainer subclass that preserves dataset order for alternating hybrid rows."""
 
     class SequentialSamplerTrainer(trainer_cls):  # type: ignore[misc, valid-type]
-        def _get_train_sampler(self) -> Any:
-            if self.train_dataset is None:
+        def _get_train_sampler(self, train_dataset: Any | None = None) -> Any:
+            dataset = train_dataset if train_dataset is not None else self.train_dataset
+            if dataset is None:
                 return None
             from torch.utils.data import SequentialSampler
 
-            return SequentialSampler(self.train_dataset)
+            return SequentialSampler(dataset)
 
     return SequentialSamplerTrainer
 

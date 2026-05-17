@@ -288,3 +288,14 @@ def test_sequential_sampler_trainer_preserves_dataset_order():
     sampler = trainer_cls(["math", "tool"])._get_train_sampler()
 
     assert list(sampler) == [0, 1]
+
+
+def test_sequential_sampler_trainer_accepts_transformers_dataset_argument():
+    class FakeTrainer:
+        def __init__(self, train_dataset):
+            self.train_dataset = train_dataset
+
+    trainer_cls = with_sequential_train_sampler(FakeTrainer)
+    sampler = trainer_cls(["unused"])._get_train_sampler(["math", "tool", "math"])
+
+    assert list(sampler) == [0, 1, 2]
