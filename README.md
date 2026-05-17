@@ -145,6 +145,8 @@ python -m interleaved_grpo.train \
   --dataset-split train \
   --max-samples 5000 \
   --output-dir ./runs/toolmind_interleaved \
+  --max-prompt-length 4096 \
+  --max-completion-length 2048 \
   --num-generations 4
 ```
 
@@ -306,6 +308,8 @@ The language reward uses `cantofilter` when installed for Cantonese detection, w
 
 - `num_generations` is the GRPO group size. The default is `4`; override it with `--num-generations`.
 - `--beta 0.01` is the default KL coefficient.
+- `--filter-overlong-prompts` is enabled by default and drops formatted rows whose tokenized prompt exceeds `--max-prompt-length`. Use `--no-filter-overlong-prompts` to keep TRL's truncation behavior.
+- For ToolMind with Qwen2.5 chat formatting, `--max-prompt-length 4096 --max-completion-length 2048` covers roughly 97% of rows. Use `6144/4096` for roughly 99.6% coverage if memory allows.
 - `--use-lora` trains PEFT LoRA adapters instead of all model weights. Defaults are rank `16`, alpha `32`, dropout `0.05`, and Qwen/Llama-style attention plus MLP target modules.
 - `--lora-target-modules` accepts a comma-separated list; adjust it if your base model uses different projection module names.
 - `--sequential-hybrid-sampler` is enabled by default so hybrid rows preserve the alternating math/tool order.

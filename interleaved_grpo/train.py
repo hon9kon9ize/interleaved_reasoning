@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--max-prompt-length", type=int, default=512)
+    parser.add_argument(
+        "--filter-overlong-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop formatted training rows whose prompt token length exceeds --max-prompt-length.",
+    )
     parser.add_argument("--max-completion-length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--beta", type=float, default=0.01)
@@ -451,6 +457,46 @@ def apply_interleaved_chat_template(
     return dataset.map(process_data, batched=True, remove_columns=dataset.column_names)
 
 
+def _prompt_token_lengths(tokenizer: Any, prompts: list[str]) -> list[int]:
+    tokenized = tokenizer(prompts, add_special_tokens=False, padding=False, truncation=False)
+    return [len(input_ids) for input_ids in tokenized["input_ids"]]
+
+
+def filter_overlong_prompts(
+    dataset: Any,
+    tokenizer: Any,
+    max_prompt_length: int,
+    enabled: bool = True,
+) -> Any:
+    """Drop rows whose already-formatted prompt is too long for GRPO."""
+    if not enabled:
+        return dataset
+
+    original_size = len(dataset)
+
+    def within_prompt_limit(examples: dict[str, list[str]]) -> list[bool]:
+        return [length <= max_prompt_length for length in _prompt_token_lengths(tokenizer, examples["prompt"])]
+
+    filtered = dataset.filter(
+        within_prompt_limit,
+        batched=True,
+        desc=f"Filtering prompts longer than {max_prompt_length} tokens",
+    )
+    filtered_size = len(filtered)
+    dropped = original_size - filtered_size
+    print(
+        f"Prompt length filter kept {filtered_size}/{original_size} rows "
+        f"and dropped {dropped} rows over {max_prompt_length} tokens."
+    )
+
+    if filtered_size == 0:
+        raise ValueError(
+            "Prompt length filtering removed every training row. "
+            "Increase --max-prompt-length or pass --no-filter-overlong-prompts."
+        )
+    return filtered
+
+
 def main() -> None:
     from transformers import AutoTokenizer
     from trl import GRPOConfig, GRPOTrainer
@@ -462,6 +508,12 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dataset = apply_interleaved_chat_template(dataset_from_args(args), tokenizer, default_reasoning_lang=args.reasoning_lang)
+    dataset = filter_overlong_prompts(
+        dataset,
+        tokenizer,
+        max_prompt_length=args.max_prompt_length,
+        enabled=args.filter_overlong_prompts,
+    )
     reward_funcs = select_reward_funcs(args, dataset)
     reward_weights = resolve_reward_weights(args, reward_funcs)
     peft_config = build_peft_config(args)

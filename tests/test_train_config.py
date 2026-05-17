@@ -1,11 +1,14 @@
 import json
 
+import pytest
+
 from interleaved_grpo.train import (
     GenerationRewardLogger,
     build_peft_config,
     build_parser,
     build_trainer_model_kwargs,
     dataset_has_reasoning_lang,
+    filter_overlong_prompts,
     generation_log_path,
     resolve_reward_weights,
     resolve_report_to,
@@ -20,6 +23,7 @@ def test_train_defaults_match_agentic_reward_suite():
 
     assert args.beta == 0.01
     assert args.num_generations == 4
+    assert args.filter_overlong_prompts
     assert not args.use_lora
     assert args.lora_rank == 16
     assert resolve_reward_weights(args, select_reward_funcs(args)) == [1.0, 0.5, 0.3, 1.0]
@@ -71,6 +75,62 @@ def test_build_trainer_model_kwargs_passes_peft_config_when_supported():
         "model": "test/model",
         "peft_config": peft_config,
     }
+
+
+def test_filter_overlong_prompts_drops_rows_by_tokenized_prompt_length():
+    class FakeDataset:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __len__(self):
+            return len(self.rows)
+
+        def filter(self, function, batched=False, desc=None):
+            assert batched
+            assert desc
+            examples = {"prompt": [row["prompt"] for row in self.rows]}
+            keep = function(examples)
+            return FakeDataset([row for row, should_keep in zip(self.rows, keep) if should_keep])
+
+    class WhitespaceTokenizer:
+        def __call__(self, prompts, **kwargs):
+            return {"input_ids": [prompt.split() for prompt in prompts]}
+
+    dataset = FakeDataset(
+        [
+            {"prompt": "one two"},
+            {"prompt": "one two three four"},
+            {"prompt": "one"},
+        ]
+    )
+
+    filtered = filter_overlong_prompts(dataset, WhitespaceTokenizer(), max_prompt_length=2)
+
+    assert [row["prompt"] for row in filtered.rows] == ["one two", "one"]
+
+
+def test_filter_overlong_prompts_can_be_disabled():
+    dataset = object()
+
+    assert filter_overlong_prompts(dataset, tokenizer=None, max_prompt_length=1, enabled=False) is dataset
+
+
+def test_filter_overlong_prompts_rejects_empty_result():
+    class FakeDataset:
+        rows = [{"prompt": "too long"}]
+
+        def __len__(self):
+            return len(self.rows)
+
+        def filter(self, function, batched=False, desc=None):
+            return EmptyDataset()
+
+    class EmptyDataset:
+        def __len__(self):
+            return 0
+
+    with pytest.raises(ValueError, match="removed every training row"):
+        filter_overlong_prompts(FakeDataset(), tokenizer=lambda prompts, **_: {"input_ids": [[1, 2, 3]]}, max_prompt_length=1)
 
 
 def test_reasoning_lang_selects_language_reward():

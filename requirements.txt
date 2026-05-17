@@ -1,5 +1,6 @@
 accelerate
 datasets
+jinja2
 peft
 pytest
 sympy

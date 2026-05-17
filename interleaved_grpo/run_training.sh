@@ -15,6 +15,7 @@ ARGS=(
   --per-device-train-batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}"
   --num-generations "${NUM_GENERATIONS:-4}"
+  --max-prompt-length "${MAX_PROMPT_LENGTH:-512}"
   --max-completion-length "${MAX_COMPLETION_LENGTH:-1024}"
   --learning-rate "${LEARNING_RATE:-5e-6}"
 )
@@ -25,6 +26,10 @@ fi
 
 if [[ -n "${REASONING_LANG:-}" ]]; then
   ARGS+=(--reasoning-lang "${REASONING_LANG}")
+fi
+
+if [[ "${FILTER_OVERLONG_PROMPTS:-1}" != "1" ]]; then
+  ARGS+=(--no-filter-overlong-prompts)
 fi
 
 if [[ "${USE_VLLM:-0}" == "1" ]]; then
