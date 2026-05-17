@@ -11,6 +11,7 @@ from interleaved_grpo.train import (
     dataset_has_reasoning_lang,
     filter_overlong_prompts,
     generation_log_path,
+    make_json_safe,
     normalize_prefilled_think_completion,
     prompt_prefills_open_think,
     resolve_loss_type,
@@ -115,6 +116,32 @@ def test_build_grpo_config_ignores_unsupported_trl_kwargs(monkeypatch, capsys):
     assert config.learning_rate == 1e-5
     assert config.generation_kwargs == {"max_new_tokens": 2048}
     assert "max_prompt_length" in capsys.readouterr().out
+
+
+def test_build_grpo_config_converts_model_init_kwargs_to_json_safe_values(monkeypatch):
+    class GRPOConfigWithModelKwargs:
+        def __init__(self, output_dir, model_init_kwargs=None):
+            self.output_dir = output_dir
+            self.model_init_kwargs = model_init_kwargs
+
+    class NotJsonSerializable:
+        def __str__(self):
+            return "not-json"
+
+    monkeypatch.setattr("interleaved_grpo.train._model_init_kwargs", lambda args: {"torch_dtype": NotJsonSerializable()})
+    args = build_parser().parse_args([])
+
+    config = build_grpo_config(GRPOConfigWithModelKwargs, args, [1.0])
+
+    assert config.model_init_kwargs == {"torch_dtype": "not-json"}
+
+
+def test_make_json_safe_handles_nested_values():
+    class NotJsonSerializable:
+        def __str__(self):
+            return "converted"
+
+    assert make_json_safe({"items": [NotJsonSerializable()]}) == {"items": ["converted"]}
 
 
 def test_dapo_flag_resolves_loss_type_and_passes_supported_config(monkeypatch):

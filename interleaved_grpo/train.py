@@ -154,6 +154,15 @@ def _jsonable(value: Any) -> Any:
         return str(value)
 
 
+def make_json_safe(value: Any) -> Any:
+    """Recursively convert values to JSON-serializable forms for TrainingArguments."""
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    return _jsonable(value)
+
+
 def prompt_prefills_open_think(prompt: Any) -> bool:
     """Return whether a chat template left an opening `<think>` in the prompt."""
     text = "" if prompt is None else str(prompt)
@@ -499,6 +508,8 @@ def build_grpo_config(config_cls: Any, args: argparse.Namespace, reward_weights:
     if supported is not None and "max_completion_length" not in supported and "generation_kwargs" in supported:
         kwargs["generation_kwargs"] = {"max_new_tokens": args.max_completion_length}
     filtered = filter_supported_init_kwargs(config_cls, kwargs, "GRPOConfig")
+    if "model_init_kwargs" in filtered:
+        filtered["model_init_kwargs"] = make_json_safe(filtered["model_init_kwargs"])
     return config_cls(**filtered)
 
 
